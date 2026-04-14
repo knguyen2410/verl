@@ -51,6 +51,18 @@ target_modules: all-linear
 # Exclude modules from LoRA adaptation
 exclude_modules: null
 
+# Glob patterns for base-model parameters to fully finetune even when LoRA is enabled
+full_finetune_modules: null
+
+# Number of transformer blocks from the beginning to fully finetune when LoRA is enabled
+full_finetune_first_layers: 0
+
+# Number of transformer blocks from the end to fully finetune when LoRA is enabled
+full_finetune_last_layers: 0
+
+# Optional path to perturb vocabulary embedding tensor (shape: [vocab_size, hidden_dim])
+vocab_dp_path: null
+
 # Path to pre-trained LoRA adapter to load for continued training
 lora_adapter_path: null
 

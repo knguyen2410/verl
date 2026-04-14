@@ -59,7 +59,12 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
-from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+from verl.utils.model import (
+    convert_weight_keys,
+    extract_multi_modal_inputs,
+    load_hybrid_trainable_params_if_available,
+    unfreeze_params_by_patterns,
+)
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import (
@@ -307,6 +312,15 @@ class FSDPEngine(BaseEngine):
             # Ensure task_type is TaskType enum, not string
             if isinstance(peft_config.task_type, str):
                 peft_config.task_type = TaskType.CAUSAL_LM
+
+            loaded, num_tensors, num_missing, num_unexpected = load_hybrid_trainable_params_if_available(
+                module, local_adapter_path
+            )
+            if loaded and self.rank == 0:
+                print(
+                    "[model] Loaded hybrid trainable params from adapter checkpoint: "
+                    f"{num_tensors} tensors ({num_missing} missing, {num_unexpected} unexpected)"
+                )
         else:
             # Convert config to regular Python types before creating PEFT model
             lora_config = {
@@ -319,6 +333,13 @@ class FSDPEngine(BaseEngine):
                 "bias": "none",
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
+
+        num_unfrozen, num_matched = unfreeze_params_by_patterns(module, self.model_config.full_finetune_modules)
+        if self.model_config.full_finetune_modules and self.rank == 0:
+            print(
+                "[model] full_finetune_modules matched "
+                f"{num_matched} parameter names and unfroze {num_unfrozen} parameters"
+            )
 
         return module
 

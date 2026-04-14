@@ -215,10 +215,11 @@ class vLLMHttpServer:
         logger.info(f"override_generation_config: {override_generation_config}")
 
         logger.info(f"enable_sleep_mode: {self.config.enable_sleep_mode}")
-        if not self.config.enable_sleep_mode:
-            from verl.utils.device import set_expandable_segments
+        from verl.utils.device import set_expandable_segments
 
-            set_expandable_segments(True)
+        # vLLM CuMemAllocator (used by sleep/collective_rpc) is incompatible with
+        # expandable CUDA segments in recent torch/vLLM combinations.
+        set_expandable_segments(False)
 
         quantization, hf_overrides = self._apply_quantization()
 

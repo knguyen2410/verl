@@ -1564,10 +1564,20 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
+                    rollout_update_interval = int(self.config.trainer.get("rollout_update_interval", 1))
+                    if rollout_update_interval < 1:
+                        rollout_update_interval = 1
+
+                    should_update_rollout_weights = (
+                        is_last_step or self.global_steps % rollout_update_interval == 0
+                    )
+
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
-                        # Still in critic warmup, only update weights to wake up rollout replicas.
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                        # Still in critic warmup, periodically update weights to wake up rollout replicas.
+                        if should_update_rollout_weights:
+                            self.checkpoint_manager.update_weights(self.global_steps)
+                        metrics["trainer/rollout_weights_updated"] = float(should_update_rollout_weights)
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -1596,8 +1606,10 @@ class RayPPOTrainer:
                                 self._save_checkpoint()
 
                         # update weights from trainer to rollout
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                        if should_update_rollout_weights:
+                            with marked_timer("update_weights", timing_raw, color="red"):
+                                self.checkpoint_manager.update_weights(self.global_steps)
+                        metrics["trainer/rollout_weights_updated"] = float(should_update_rollout_weights)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

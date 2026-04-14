@@ -19,6 +19,7 @@ import json
 import os
 import re
 import warnings
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from typing import Optional
 
@@ -190,6 +191,96 @@ def print_model_size(model: nn.Module, name: str = None):
     if name is None:
         name = model.__class__.__name__
     print(f"{name} contains {n_params:.2f}{scale} parameters")
+
+
+def unfreeze_params_by_patterns(module: nn.Module, patterns: Optional[list[str]]) -> tuple[int, int]:
+    """Unfreeze parameters whose names match any glob pattern.
+
+    Args:
+        module: Model to update.
+        patterns: Glob-style patterns (e.g., ``*layers.0.*``).
+
+    Returns:
+        A tuple of ``(num_unfrozen, num_matched_names)``.
+    """
+    if not patterns:
+        return 0, 0
+
+    matched_names: set[str] = set()
+    num_unfrozen = 0
+
+    for name, param in module.named_parameters():
+        if any(fnmatch(name, pattern) for pattern in patterns):
+            matched_names.add(name)
+            if not param.requires_grad:
+                param.requires_grad_(True)
+                num_unfrozen += 1
+
+    return num_unfrozen, len(matched_names)
+
+
+def collect_non_lora_trainable_params(
+    module: nn.Module, include_embed_tokens: bool = True
+) -> tuple[dict[str, torch.Tensor], int, int]:
+    """Collect trainable tensors excluding LoRA tensors for hybrid checkpoints.
+
+    Returns:
+        (state_dict, num_tensors, num_elements)
+    """
+    state_dict: dict[str, torch.Tensor] = {}
+
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "lora_" in name or "modules_to_save" in name:
+            continue
+
+        save_name = name
+        if save_name.startswith("base_model.model."):
+            save_name = save_name[len("base_model.model.") :]
+        state_dict[save_name] = param.detach().cpu().clone()
+
+    if include_embed_tokens and hasattr(module, "get_input_embeddings"):
+        try:
+            embed = module.get_input_embeddings()
+            if embed is not None and hasattr(embed, "weight") and "model.embed_tokens.weight" not in state_dict:
+                state_dict["model.embed_tokens.weight"] = embed.weight.detach().cpu().clone()
+        except Exception:
+            pass
+
+    num_tensors = len(state_dict)
+    num_elements = sum(t.numel() for t in state_dict.values())
+    return state_dict, num_tensors, num_elements
+
+
+def load_hybrid_trainable_params_if_available(
+    module: nn.Module, checkpoint_dir: str, filename: str = "pgcode_trainable_params.bin"
+) -> tuple[bool, int, int, int]:
+    """Load hybrid full-tuned tensors if they exist next to a LoRA checkpoint.
+
+    Returns:
+        (loaded, num_tensors, num_missing, num_unexpected)
+    """
+    if not checkpoint_dir:
+        return False, 0, 0, 0
+
+    trainable_path = os.path.join(checkpoint_dir, filename)
+    if not os.path.isfile(trainable_path):
+        return False, 0, 0, 0
+
+    trainable_state_dict = torch.load(trainable_path, map_location="cpu")
+    if not isinstance(trainable_state_dict, dict):
+        raise ValueError(f"Expected a dict in {trainable_path}, got {type(trainable_state_dict).__name__}")
+
+    is_peft_model = hasattr(module, "peft_config") and hasattr(module, "base_model")
+    if is_peft_model:
+        trainable_state_dict = {
+            (f"base_model.model.{k}" if not k.startswith("base_model.model.") else k): v
+            for k, v in trainable_state_dict.items()
+        }
+
+    missing, unexpected = module.load_state_dict(trainable_state_dict, strict=False)
+    return True, len(trainable_state_dict), len(missing), len(unexpected)
 
 
 def create_random_mask(

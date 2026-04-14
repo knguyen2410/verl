@@ -19,6 +19,14 @@ from packaging import version
 logger = logging.getLogger(__name__)
 
 
+def has_visible_cuda_device() -> bool:
+    """Return True only when CUDA is available and at least one GPU is visible."""
+    try:
+        return torch.cuda.is_available() and torch.cuda.device_count() > 0
+    except Exception:
+        return False
+
+
 def is_torch_npu_available(check_device=True) -> bool:
     """Check if Ascend NPU is available for PyTorch operations.
 
@@ -52,7 +60,7 @@ def get_resource_name() -> str:
     Returns:
         ray resource name string, either "GPU" or "NPU".
     """
-    return "GPU" if is_cuda_available else "NPU"
+    return "GPU" if has_visible_cuda_device() else "NPU"
 
 
 def get_visible_devices_keyword() -> str:
@@ -77,9 +85,11 @@ def get_device_name() -> str:
     Returns:
         str: Device type string ('cuda', 'npu', or 'cpu').
     """
-    if is_cuda_available:
+    # Query accelerator availability at call time because worker environments
+    # (e.g., Ray setting CUDA_VISIBLE_DEVICES) can differ from import time.
+    if has_visible_cuda_device():
         device = "cuda"
-    elif is_npu_available:
+    elif is_torch_npu_available():
         device = "npu"
     else:
         device = "cpu"
@@ -122,7 +132,7 @@ def get_nccl_backend() -> str:
     Returns:
         str: Backend name ('hccl' for NPU, 'nccl' for CUDA/default).
     """
-    if is_npu_available:
+    if is_torch_npu_available():
         return "hccl"
     else:
         # default to nccl
@@ -142,7 +152,7 @@ def set_expandable_segments(enable: bool) -> None:
     Note:
         This function only has an effect when CUDA is available.
     """
-    if is_cuda_available:
+    if has_visible_cuda_device():
         torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
 
 
@@ -178,7 +188,7 @@ def get_device_capability(device_id: int = 0) -> tuple[int | None, int | None]:
             or (None, None) if CUDA is not available.
     """
     major, minor = None, None
-    if is_cuda_available:
+    if has_visible_cuda_device():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     return major, minor
@@ -306,11 +316,11 @@ def is_support_ipc() -> bool:
         bool: True if IPC is supported, False otherwise.
     """
     # If CUDA is available, it's a GPU device
-    if is_cuda_available:
+    if has_visible_cuda_device():
         return True
 
     # For NPU devices, check the software version and CANN toolkit version
-    if is_npu_available:
+    if is_torch_npu_available():
         try:
             software_version, cann_version = get_npu_versions()
             return check_ipc_version_support(software_version, cann_version)

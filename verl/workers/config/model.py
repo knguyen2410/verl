@@ -126,6 +126,16 @@ class HFModelConfig(BaseConfig):
     lora_alpha: int = 16
     target_modules: Optional[Any] = "all-linear"  # allow both "all-linear" and ["q_proj","k_proj"]
     target_parameters: Optional[list[str]] = None  # for lora adapter on nn.Parameter
+    full_finetune_modules: Optional[list[str]] = None
+
+    # Number of transformer blocks from the beginning to fully finetune when LoRA is enabled
+    full_finetune_first_layers: int = 0
+
+    # Number of transformer blocks from the end to fully finetune when LoRA is enabled
+    full_finetune_last_layers: int = 0
+
+    # Optional path to perturb vocabulary embedding tensor (shape: [vocab_size, hidden_dim])
+    vocab_dp_path: Optional[str] = None
 
     exclude_modules: Optional[str] = None
 
@@ -231,6 +241,31 @@ class HFModelConfig(BaseConfig):
                         raise TypeError(
                             f"All elements in target_modules list must be strings, but found {type(x).__name__}"
                         )
+
+        if self.full_finetune_modules is not None:
+            if not isinstance(self.full_finetune_modules, list):
+                raise TypeError(
+                    "full_finetune_modules must be a list of strings, "
+                    f"but got {type(self.full_finetune_modules).__name__}"
+                )
+            for x in self.full_finetune_modules:
+                if not isinstance(x, str):
+                    raise TypeError(
+                        "All elements in full_finetune_modules must be strings, "
+                        f"but found {type(x).__name__}"
+                    )
+
+        if self.full_finetune_first_layers < 0:
+            raise ValueError(
+                "full_finetune_first_layers must be non-negative, "
+                f"but got {self.full_finetune_first_layers}"
+            )
+
+        if self.full_finetune_last_layers < 0:
+            raise ValueError(
+                "full_finetune_last_layers must be non-negative, "
+                f"but got {self.full_finetune_last_layers}"
+            )
 
     def get_processor(self):
         return self.processor if self.processor is not None else self.tokenizer

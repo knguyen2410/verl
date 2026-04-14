@@ -32,6 +32,7 @@ from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
+from verl.utils.model import collect_non_lora_trainable_params
 from verl.utils.transformers_compat import get_auto_model_for_vision2seq
 
 from .checkpoint_manager import BaseCheckpointManager
@@ -283,6 +284,28 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 logger=logger,
                 log_only_rank_0=True,
             )
+
+            hybrid_state_dict, num_tensors, num_elements = collect_non_lora_trainable_params(unwrap_model)
+            if num_tensors > 0:
+                hybrid_path = os.path.join(local_path, "pgcode_trainable_params.bin")
+                torch.save(hybrid_state_dict, hybrid_path)
+                log_with_rank(
+                    "Saved hybrid trainable params to "
+                    f"{os.path.abspath(hybrid_path)} ({num_tensors} tensors, {num_elements} elements)",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+
+                hybrid_hf_path = os.path.join(hf_config_tokenizer_path, "pgcode_trainable_params.bin")
+                torch.save(hybrid_state_dict, hybrid_hf_path)
+                log_with_rank(
+                    "Saved hybrid trainable params companion to "
+                    f"{os.path.abspath(hybrid_hf_path)}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
 
             # If we have a custom model, we copy the file defining it in the folder and set the attributes so it can be
             # loaded from the Hub.

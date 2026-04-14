@@ -83,17 +83,50 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
     import torch.distributed
 
     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
-    backend = backend or f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
+    if backend is None:
+        device_name = get_device_name()
+        # CPU-only workers should use plain gloo instead of a custom backend string.
+        # Using "cpu:*" twice (e.g. cpu:gloo,cpu:nccl) is invalid in torch.distributed.
+        backend = "gloo" if device_name == "cpu" else f"cpu:gloo,{device_name}:{get_nccl_backend()}"
+    # Guard against worker environments where CUDA/NCCL cannot be initialized.
+    if "nccl" in str(backend).lower():
+        cuda_available = torch.cuda.is_available()
+        cuda_device_count = torch.cuda.device_count()
+        if not cuda_available and cuda_device_count > 0:
+            raise ValueError(
+                "NCCL backend requested, but torch.cuda.is_available() is False while "
+                f"torch.cuda.device_count()={cuda_device_count}. This usually means the "
+                "installed PyTorch CUDA build is incompatible with the host CUDA driver "
+                "(for example, torch+cu130 on a CUDA 12.8 driver API)."
+            )
+        # No visible GPU for this worker (e.g., CPU-only rank). Avoid NCCL init.
+        if cuda_device_count == 0:
+            backend = "gloo"
     if not torch.distributed.is_initialized():
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        torch.distributed.init_process_group(
-            backend=backend,
-            rank=rank,
-            world_size=world_size,
-            timeout=timeout,
-            init_method=os.environ.get("DIST_INIT_METHOD", None),
-        )
+        try:
+            torch.distributed.init_process_group(
+                backend=backend,
+                rank=rank,
+                world_size=world_size,
+                timeout=timeout,
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
+        except ValueError as e:
+            err_msg = str(e)
+            # Some Ray workers may report CUDA visible at probe time but still fail
+            # NCCL initialization. Retry with gloo for control-plane collectives.
+            if "no GPUs found" in err_msg and "nccl" in str(backend).lower():
+                torch.distributed.init_process_group(
+                    backend="gloo",
+                    rank=rank,
+                    world_size=world_size,
+                    timeout=timeout,
+                    init_method=os.environ.get("DIST_INIT_METHOD", None),
+                )
+            else:
+                raise
 
 
 def stateless_init_process_group(master_address, master_port, rank, world_size, device):

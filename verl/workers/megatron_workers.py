@@ -293,8 +293,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if not torch.distributed.is_initialized():
             set_numa_affinity()
             rank = int(os.environ["LOCAL_RANK"])
+            backend = "gloo" if get_device_name() == "cpu" else f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
             torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                backend=backend,
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )

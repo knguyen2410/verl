@@ -81,7 +81,11 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import convert_weight_keys
+from verl.utils.model import (
+    convert_weight_keys,
+    load_hybrid_trainable_params_if_available,
+    unfreeze_params_by_patterns,
+)
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -143,6 +147,53 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def _get_num_hidden_layers(model_config) -> int | None:
+    config_for_layers = getattr(model_config, "text_config", model_config)
+    return (
+        getattr(config_for_layers, "num_hidden_layers", None)
+        or getattr(config_for_layers, "num_layers", None)
+        or getattr(config_for_layers, "n_layer", None)
+    )
+
+
+def _build_hybrid_layer_selection(num_layers: int | None, first_layers: int, last_layers: int) -> tuple[set[int], list[int]]:
+    if num_layers is None or num_layers <= 0:
+        return set(), []
+
+    first_layers = max(0, min(first_layers, num_layers))
+    last_layers = max(0, min(last_layers, num_layers))
+
+    full_layer_ids = set(range(first_layers))
+    full_layer_ids.update(range(num_layers - last_layers, num_layers))
+    lora_layer_ids = [i for i in range(num_layers) if i not in full_layer_ids]
+    return full_layer_ids, lora_layer_ids
+
+
+def _build_full_finetune_patterns_from_layer_ids(layer_ids: set[int], include_final_modules: bool = False) -> list[str]:
+    patterns: list[str] = []
+    for layer_id in sorted(layer_ids):
+        patterns.extend(
+            [
+                f"*.layers.{layer_id}.*",
+                f"*.h.{layer_id}.*",
+                f"*.decoder.layers.{layer_id}.*",
+                f"*.encoder.layers.{layer_id}.*",
+                f"*.transformer.h.{layer_id}.*",
+            ]
+        )
+
+    if include_final_modules:
+        patterns.extend([
+            "*lm_head*",
+            "*model.norm*",
+            "*ln_f*",
+            "*final_layernorm*",
+        ])
+
+    # Keep order stable while removing duplicates.
+    return list(dict.fromkeys(patterns))
+
+
 @deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
@@ -159,8 +210,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
+            backend = "gloo" if get_device_name() == "cpu" else f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
             torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                backend=backend,
                 rank=rank,
                 world_size=world_size,
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
@@ -379,8 +431,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        use_shm = self.config.model.get("use_shm", False)
+        tokenizer_path = copy_to_local(self.config.model.get("tokenizer_path") or model_path, use_shm=use_shm)
+        self.tokenizer = hf_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(tokenizer_path, trust_remote_code=trust_remote_code)
 
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
@@ -507,12 +561,87 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
+            # Keep model vocab size aligned with tokenizer when tokenizer_path points to a different tokenizer.
+            target_vocab_size = len(self.tokenizer)
+            current_vocab_size = actor_module.get_input_embeddings().weight.shape[0]
+            if target_vocab_size != current_vocab_size:
+                actor_module.resize_token_embeddings(target_vocab_size)
+                actor_model_config.vocab_size = target_vocab_size
+                if self.rank == 0:
+                    print(
+                        "[actor model] Resized token embeddings from "
+                        f"{current_vocab_size} to {target_vocab_size} to match tokenizer"
+                    )
+
+            vocab_dp_path = self.config.model.get("vocab_dp_path")
+            if vocab_dp_path:
+                local_vocab_dp_path = copy_to_local(vocab_dp_path, use_shm=use_shm)
+                perturb_embed = torch.load(local_vocab_dp_path, map_location="cpu")
+                if not torch.is_tensor(perturb_embed) or perturb_embed.ndim != 2:
+                    raise ValueError(
+                        "model.vocab_dp_path must point to a 2D tensor with shape [vocab_size, hidden_dim]"
+                    )
+
+                perturb_vocab_size, perturb_hidden_size = perturb_embed.shape
+                input_embeddings = actor_module.get_input_embeddings()
+                if input_embeddings.weight.shape[0] != perturb_vocab_size:
+                    actor_module.resize_token_embeddings(perturb_vocab_size)
+                    input_embeddings = actor_module.get_input_embeddings()
+
+                if input_embeddings.weight.shape[1] != perturb_hidden_size:
+                    raise ValueError(
+                        "Perturb vocab embedding hidden size mismatch: "
+                        f"expected {input_embeddings.weight.shape[1]}, got {perturb_hidden_size}"
+                    )
+
+                with torch.no_grad():
+                    input_embeddings.weight.copy_(
+                        perturb_embed.to(dtype=input_embeddings.weight.dtype, device=input_embeddings.weight.device)
+                    )
+
+                actor_model_config.vocab_size = perturb_vocab_size
+                if self.rank == 0:
+                    print(
+                        "[actor model] Loaded perturb vocab embeddings from "
+                        f"{local_vocab_dp_path} with vocab size {perturb_vocab_size}"
+                    )
+
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if self._is_lora:
             print("Applying LoRA to actor module")
             actor_module.enable_input_require_grads()
+
+            full_finetune_first_layers = int(self.config.model.get("full_finetune_first_layers", 0) or 0)
+            full_finetune_last_layers = int(self.config.model.get("full_finetune_last_layers", 0) or 0)
+            num_layers = _get_num_hidden_layers(actor_model_config)
+            full_layer_ids, lora_layer_ids = _build_hybrid_layer_selection(
+                num_layers=num_layers,
+                first_layers=full_finetune_first_layers,
+                last_layers=full_finetune_last_layers,
+            )
+
+            auto_full_finetune_modules = _build_full_finetune_patterns_from_layer_ids(
+                full_layer_ids, include_final_modules=full_finetune_last_layers > 0
+            )
+            configured_full_finetune_modules = convert_to_regular_types(
+                self.config.model.get("full_finetune_modules", None)
+            )
+            full_finetune_modules = (
+                (configured_full_finetune_modules or []) + auto_full_finetune_modules
+                if configured_full_finetune_modules is not None or auto_full_finetune_modules
+                else None
+            )
+            if full_finetune_modules:
+                full_finetune_modules = list(dict.fromkeys(full_finetune_modules))
+
+            if self.rank == 0 and (full_finetune_first_layers > 0 or full_finetune_last_layers > 0):
+                print(
+                    "[actor model] Hybrid tuning enabled: "
+                    f"first={full_finetune_first_layers}, last={full_finetune_last_layers}, "
+                    f"num_layers={num_layers}, full_layers={sorted(full_layer_ids)}, lora_layers={lora_layer_ids}"
+                )
 
             lora_adapter_path = self.config.model.get("lora_adapter_path")
             if lora_adapter_path is not None:
@@ -529,6 +658,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if isinstance(peft_config.task_type, str):
                     peft_config.task_type = TaskType.CAUSAL_LM
 
+                loaded, num_tensors, num_missing, num_unexpected = load_hybrid_trainable_params_if_available(
+                    actor_module, local_adapter_path
+                )
+                if loaded and self.rank == 0:
+                    print(
+                        "[actor model] Loaded hybrid trainable params from adapter checkpoint: "
+                        f"{num_tensors} tensors ({num_missing} missing, {num_unexpected} unexpected)"
+                    )
+
             else:
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
@@ -539,7 +677,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
                 }
+                if lora_layer_ids and len(lora_layer_ids) != (num_layers or 0):
+                    lora_config["layers_to_transform"] = lora_layer_ids
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+            num_unfrozen, num_matched = unfreeze_params_by_patterns(actor_module, full_finetune_modules)
+            if full_finetune_modules:
+                if self.rank == 0:
+                    print(
+                        "[actor model] full_finetune_modules matched "
+                        f"{num_matched} parameter names and unfroze {num_unfrozen} parameters"
+                    )
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -1485,12 +1633,84 @@ class CriticWorker(Worker, DistProfilerExtension):
             # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)
 
+            target_vocab_size = len(self.tokenizer)
+            current_vocab_size = critic_module.get_input_embeddings().weight.shape[0]
+            if target_vocab_size != current_vocab_size:
+                critic_module.resize_token_embeddings(target_vocab_size)
+                critic_model_config.vocab_size = target_vocab_size
+                if self.rank == 0:
+                    print(
+                        "[critic model] Resized token embeddings from "
+                        f"{current_vocab_size} to {target_vocab_size} to match tokenizer"
+                    )
+
+            vocab_dp_path = config.model.get("vocab_dp_path")
+            if vocab_dp_path:
+                local_vocab_dp_path = copy_to_local(vocab_dp_path, use_shm=use_shm)
+                perturb_embed = torch.load(local_vocab_dp_path, map_location="cpu")
+                if not torch.is_tensor(perturb_embed) or perturb_embed.ndim != 2:
+                    raise ValueError(
+                        "model.vocab_dp_path must point to a 2D tensor with shape [vocab_size, hidden_dim]"
+                    )
+
+                perturb_vocab_size, perturb_hidden_size = perturb_embed.shape
+                input_embeddings = critic_module.get_input_embeddings()
+                if input_embeddings.weight.shape[0] != perturb_vocab_size:
+                    critic_module.resize_token_embeddings(perturb_vocab_size)
+                    input_embeddings = critic_module.get_input_embeddings()
+
+                if input_embeddings.weight.shape[1] != perturb_hidden_size:
+                    raise ValueError(
+                        "Perturb vocab embedding hidden size mismatch: "
+                        f"expected {input_embeddings.weight.shape[1]}, got {perturb_hidden_size}"
+                    )
+
+                with torch.no_grad():
+                    input_embeddings.weight.copy_(
+                        perturb_embed.to(dtype=input_embeddings.weight.dtype, device=input_embeddings.weight.device)
+                    )
+
+                critic_model_config.vocab_size = perturb_vocab_size
+                if self.rank == 0:
+                    print(
+                        "[critic model] Loaded perturb vocab embeddings from "
+                        f"{local_vocab_dp_path} with vocab size {perturb_vocab_size}"
+                    )
+
             if config.model.get("enable_gradient_checkpointing", False):
                 critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if self._is_lora:
             print("Applying LoRA to critic module")
             critic_module.enable_input_require_grads()
+
+            full_finetune_first_layers = int(config.model.get("full_finetune_first_layers", 0) or 0)
+            full_finetune_last_layers = int(config.model.get("full_finetune_last_layers", 0) or 0)
+            num_layers = _get_num_hidden_layers(critic_model_config)
+            full_layer_ids, lora_layer_ids = _build_hybrid_layer_selection(
+                num_layers=num_layers,
+                first_layers=full_finetune_first_layers,
+                last_layers=full_finetune_last_layers,
+            )
+
+            auto_full_finetune_modules = _build_full_finetune_patterns_from_layer_ids(
+                full_layer_ids, include_final_modules=full_finetune_last_layers > 0
+            )
+            configured_full_finetune_modules = convert_to_regular_types(config.model.get("full_finetune_modules", None))
+            full_finetune_modules = (
+                (configured_full_finetune_modules or []) + auto_full_finetune_modules
+                if configured_full_finetune_modules is not None or auto_full_finetune_modules
+                else None
+            )
+            if full_finetune_modules:
+                full_finetune_modules = list(dict.fromkeys(full_finetune_modules))
+
+            if self.rank == 0 and (full_finetune_first_layers > 0 or full_finetune_last_layers > 0):
+                print(
+                    "[critic model] Hybrid tuning enabled: "
+                    f"first={full_finetune_first_layers}, last={full_finetune_last_layers}, "
+                    f"num_layers={num_layers}, full_layers={sorted(full_layer_ids)}, lora_layers={lora_layer_ids}"
+                )
 
             # Check if we should load a pre-trained LoRA adapter
             lora_adapter_path = self.config.model.get("lora_adapter_path")
@@ -1509,6 +1729,15 @@ class CriticWorker(Worker, DistProfilerExtension):
                 if isinstance(peft_config.task_type, str):
                     peft_config.task_type = TaskType.TOKEN_CLS
 
+                loaded, num_tensors, num_missing, num_unexpected = load_hybrid_trainable_params_if_available(
+                    critic_module, local_adapter_path
+                )
+                if loaded and self.rank == 0:
+                    print(
+                        "[critic model] Loaded hybrid trainable params from adapter checkpoint: "
+                        f"{num_tensors} tensors ({num_missing} missing, {num_unexpected} unexpected)"
+                    )
+
             else:
                 # Convert config to regular Python types before creating PEFT model
                 # Use TOKEN_CLS for Critic since it's loaded as AutoModelForTokenClassification
@@ -1519,7 +1748,16 @@ class CriticWorker(Worker, DistProfilerExtension):
                     "target_modules": convert_to_regular_types(self.config.model.target_modules),
                     "bias": "none",
                 }
+                if lora_layer_ids and len(lora_layer_ids) != (num_layers or 0):
+                    lora_config["layers_to_transform"] = lora_layer_ids
                 critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
+
+            num_unfrozen, num_matched = unfreeze_params_by_patterns(critic_module, full_finetune_modules)
+            if full_finetune_modules and self.rank == 0:
+                print(
+                    "[critic model] full_finetune_modules matched "
+                    f"{num_matched} parameter names and unfroze {num_unfrozen} parameters"
+                )
 
         if self.rank == 0:
             print_model_size(critic_module)
