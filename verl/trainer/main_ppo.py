@@ -77,27 +77,38 @@ def run_ppo(config, task_runner_class=None) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    if task_runner_class is None:
-        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+    run_taskrunner_locally = bool(config.trainer.get("run_taskrunner_locally", False))
 
-    # Create a remote instance of the TaskRunner class, and
-    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
-    if (
-        is_cuda_available
-        and config.global_profiler.tool == "nsys"
-        and config.global_profiler.get("steps") is not None
-        and len(config.global_profiler.get("steps", [])) > 0
-    ):
-        from verl.utils.import_utils import is_nvtx_available
-
-        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
-        nsight_options = OmegaConf.to_container(
-            config.global_profiler.global_tool_config.nsys.controller_nsight_options
-        )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+    if run_taskrunner_locally:
+        # Local mode avoids a separate Ray actor creation for TaskRunner itself.
+        print("Running TaskRunner in local process (trainer.run_taskrunner_locally=True)")
+        if task_runner_class is None:
+            runner = TaskRunner()
+        else:
+            runner = task_runner_class()
+        runner.run(config)
     else:
-        runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+        if task_runner_class is None:
+            task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+
+        # Create a remote instance of the TaskRunner class, and
+        # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+        if (
+            is_cuda_available
+            and config.global_profiler.tool == "nsys"
+            and config.global_profiler.get("steps") is not None
+            and len(config.global_profiler.get("steps", [])) > 0
+        ):
+            from verl.utils.import_utils import is_nvtx_available
+
+            assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+            nsight_options = OmegaConf.to_container(
+                config.global_profiler.global_tool_config.nsys.controller_nsight_options
+            )
+            runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        else:
+            runner = task_runner_class.remote()
+        ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -347,7 +358,7 @@ class TaskRunner:
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=False)
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

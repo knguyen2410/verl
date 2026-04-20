@@ -33,7 +33,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.teacher_loop import TeacherModelManager
-from verl.protocol import DataProto
+from verl.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
@@ -1153,7 +1153,10 @@ class AgentLoopManager:
         """
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+
+        # Ensure split is valid even when batch size is not divisible by worker count.
+        prompts_padded, pad_size = pad_dataproto_to_divisor(prompts, len(self.agent_loop_workers))
+        chunkes = prompts_padded.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
                 worker.generate_sequences.remote(chunk)
@@ -1163,6 +1166,7 @@ class AgentLoopManager:
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.sleep()
         output = DataProto.concat(outputs)
+        output = unpad_dataproto(output, pad_size=pad_size)
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
@@ -1173,9 +1177,20 @@ class AgentLoopManager:
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
-        t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
-        t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
-        num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
+        t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk], dtype=float)
+        t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk], dtype=float)
+        num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk], dtype=float)
+
+        # Metrics are collected per worker chunk before unpadding. Keep only the
+        # prefix that matches the final (unpadded) output batch to avoid OOB indices.
+        output_batch_size = output.batch["prompts"].shape[0]
+        valid_size = min(len(t_generate_sequences), output_batch_size)
+        if valid_size == 0:
+            return timing
+
+        t_generate_sequences = t_generate_sequences[:valid_size]
+        t_tool_calls = t_tool_calls[:valid_size]
+        num_preempted = num_preempted[:valid_size]
         timing["agent_loop/num_preempted/min"] = num_preempted.min()
         timing["agent_loop/num_preempted/max"] = num_preempted.max()
         timing["agent_loop/num_preempted/mean"] = num_preempted.mean()
@@ -1187,7 +1202,7 @@ class AgentLoopManager:
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
 
         # batch sequence generation is bounded by the slowest sample
-        slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        slowest = int(np.argmax(t_generate_sequences + t_tool_calls))
         prompt_length = output.batch["prompts"].shape[1]
         timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
         timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]

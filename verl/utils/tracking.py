@@ -184,20 +184,26 @@ class Tracking:
                 logger_instance.log(data=data, step=step)
 
     def __del__(self):
+        def _safe_finish(name: str, fn) -> None:
+            try:
+                fn()
+            except Exception as e:
+                logger.warning("Failed to finish %s logger during cleanup: %s", name, e)
+
         if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
+            _safe_finish("wandb", lambda: self.logger["wandb"].finish(exit_code=0))
         if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
+            _safe_finish("swanlab", self.logger["swanlab"].finish)
         if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
+            _safe_finish("vemlp_wandb", lambda: self.logger["vemlp_wandb"].finish(exit_code=0))
         if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
+            _safe_finish("tensorboard", self.logger["tensorboard"].finish)
         if "clearml" in self.logger:
-            self.logger["clearml"].finish()
+            _safe_finish("clearml", self.logger["clearml"].finish)
         if "trackio" in self.logger:
-            self.logger["trackio"].finish()
+            _safe_finish("trackio", self.logger["trackio"].finish)
         if "file" in self.logger:
-            self.logger["file"].finish()
+            _safe_finish("file", self.logger["file"].finish)
 
 
 class ClearMLLogger:

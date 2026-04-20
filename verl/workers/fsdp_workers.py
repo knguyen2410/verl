@@ -669,11 +669,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             else:
                 # Convert config to regular Python types before creating PEFT model
+                target_modules = convert_to_regular_types(self.config.model.target_modules)
+                if lora_layer_ids and isinstance(target_modules, str):
+                    # PEFT forbids layers_to_transform when target_modules is a string (e.g. "all-linear").
+                    target_modules_from_lora_cfg = convert_to_regular_types(
+                        self.config.model.get("lora", {}).get("target_modules", None)
+                    )
+                    if isinstance(target_modules_from_lora_cfg, (list, tuple)) and len(target_modules_from_lora_cfg) > 0:
+                        target_modules = list(target_modules_from_lora_cfg)
+
                 lora_config = {
                     "task_type": TaskType.CAUSAL_LM,
                     "r": self.config.model.lora_rank,
                     "lora_alpha": self.config.model.lora_alpha,
-                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    "target_modules": target_modules,
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
                 }
@@ -1741,11 +1750,20 @@ class CriticWorker(Worker, DistProfilerExtension):
             else:
                 # Convert config to regular Python types before creating PEFT model
                 # Use TOKEN_CLS for Critic since it's loaded as AutoModelForTokenClassification
+                target_modules = convert_to_regular_types(self.config.model.target_modules)
+                if lora_layer_ids and isinstance(target_modules, str):
+                    # PEFT forbids layers_to_transform when target_modules is a string (e.g. "all-linear").
+                    target_modules_from_lora_cfg = convert_to_regular_types(
+                        self.config.model.get("lora", {}).get("target_modules", None)
+                    )
+                    if isinstance(target_modules_from_lora_cfg, (list, tuple)) and len(target_modules_from_lora_cfg) > 0:
+                        target_modules = list(target_modules_from_lora_cfg)
+
                 lora_config = {
                     "task_type": TaskType.TOKEN_CLS,
                     "r": self.config.model.lora_rank,
                     "lora_alpha": self.config.model.lora_alpha,
-                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    "target_modules": target_modules,
                     "bias": "none",
                 }
                 if lora_layer_ids and len(lora_layer_ids) != (num_layers or 0):

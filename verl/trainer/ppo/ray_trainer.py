@@ -1082,6 +1082,13 @@ class RayPPOTrainer:
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
 
+        # Some short/filtered batches (e.g. tiny train batch with rollout filtering)
+        # can end up smaller than the number of DP partitions. In that case, skip
+        # balancing and keep the current ordering.
+        if len(workload_lst) < dp_size:
+            metrics[f"{logging_prefix}/balance_skipped_small_batch"] = 1.0
+            return
+
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
         if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
             from verl.utils.seqlen_balancing import get_group_balanced_partitions
@@ -1157,12 +1164,24 @@ class RayPPOTrainer:
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
+            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+            batch_padded, pad_size = pad_dataproto_to_divisor(batch, dp_size)
+            logprob_micro_bsz = self.config.actor_rollout_ref.rollout.get("log_prob_micro_batch_size_per_gpu", None)
+            if logprob_micro_bsz is None:
+                logprob_micro_bsz = self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu", 1)
             # step 1: convert dataproto to tensordict.
-            batch_td = batch.to_tensordict()
+            batch_td = batch_padded.to_tensordict()
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            metadata = {"calculate_entropy": False, "compute_loss": False}
+            metadata = {
+                "calculate_entropy": False,
+                "compute_loss": False,
+                # Dynamic seqlen balancing can trigger unstable jagged NestedTensor
+                # indexing in some torch builds for log-prob-only passes.
+                "use_dynamic_bsz": False,
+                "micro_batch_size_per_gpu": int(logprob_micro_bsz),
+            }
             if self.ref_in_actor:
                 metadata["no_lora_adapter"] = True
             tu.assign_non_tensor(batch_td, **metadata)
@@ -1177,6 +1196,7 @@ class RayPPOTrainer:
             # step 5: rebuild a tensordict and convert to dataproto
             ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
             ref_log_prob = DataProto.from_tensordict(ref_log_prob)
+            ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=pad_size)
         else:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
@@ -1184,13 +1204,25 @@ class RayPPOTrainer:
 
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
+            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+            batch_padded, pad_size = pad_dataproto_to_divisor(batch, dp_size)
+            logprob_micro_bsz = self.config.actor_rollout_ref.rollout.get("log_prob_micro_batch_size_per_gpu", None)
+            if logprob_micro_bsz is None:
+                logprob_micro_bsz = self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu", 1)
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
-            batch_td = batch.to_tensordict()
+            batch_td = batch_padded.to_tensordict()
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            tu.assign_non_tensor(
+                batch_td,
+                calculate_entropy=True,
+                compute_loss=False,
+                # Keep log-prob path on fixed micro-batches for nested tensor stability.
+                use_dynamic_bsz=False,
+                micro_batch_size_per_gpu=int(logprob_micro_bsz),
+            )
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
             entropy = tu.get(output, "entropy")
@@ -1209,6 +1241,7 @@ class RayPPOTrainer:
             else:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
+            old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0

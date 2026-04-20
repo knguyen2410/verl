@@ -115,14 +115,19 @@ def hf_processor(name_or_path, **kwargs):
     from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
 
     try:
-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+        config = AutoConfig.from_pretrained(name_or_path, **kwargs)
+        processor_kwargs = dict(kwargs)
+        # Prefer PIL backend for Qwen2.5-VL to keep compatibility with
+        # Qwen2VLImageProcessor behavior used in rollout utilities.
+        if getattr(config, "model_type", None) == "qwen2_5_vl":
+            processor_kwargs.setdefault("backend", "pil")
+
+        processor = AutoProcessor.from_pretrained(name_or_path, **processor_kwargs)
         # In newer transformers, AutoProcessor may legitimately fall back to a
         # tokenizer backend (e.g. TokenizersBackend) for text-only models.
         # Treat it as "no multimodal processor" and let callers use hf_tokenizer.
         if isinstance(processor, PreTrainedTokenizerBase):
             return None
-
-        config = AutoConfig.from_pretrained(name_or_path, **kwargs)
 
         # Bind vlm model's get_rope_index method to processor
         processor.config = config

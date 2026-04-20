@@ -218,6 +218,27 @@ def concat_tensordict_with_none_bsz(data: list[TensorDict]):
     return data[0]
 
 
+def _select_rows_from_jagged_nested_tensor(nt: torch.Tensor, indices: list[int]) -> torch.Tensor:
+    """Select rows from a jagged NestedTensor without using unbind/select.
+
+    Some torch versions route both ``unbind`` and per-row ``select`` through a
+    buggy split path for 3D jagged layouts (e.g. mRoPE position ids). Using
+    ``values`` + ``offsets`` avoids that code path entirely.
+    """
+    assert isinstance(nt, torch.Tensor) and nt.is_nested and nt.layout == torch.jagged
+    offsets = nt.offsets()
+    assert offsets is not None, "Jagged NestedTensor must expose offsets"
+    values = nt.values()
+
+    rows = []
+    for idx in indices:
+        start = int(offsets[idx].item())
+        end = int(offsets[idx + 1].item())
+        rows.append(values[start:end, ...])
+
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+
 def concat_tensordict(data: list[TensorDict]) -> TensorDict:
     """Concatenate multiple TensorDicts along dimension zero.
 
@@ -307,8 +328,8 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
         unaffected — ``unbind(dim=0)`` works correctly for them.
 
         The workaround: try ``unbind`` first (fast path for 2D); on failure,
-        fall back to ``to_padded_tensor`` → ``chunk`` → reconstruct per-chunk
-        NestedTensors using the original ragged lengths from ``offsets``.
+        reconstruct rows via ``values`` + ``offsets`` so we avoid ``unbind`` /
+        ``select`` entirely.
 
         See https://github.com/pytorch/pytorch/issues/153238
     """
@@ -327,14 +348,10 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
         try:
             tensors = nt.unbind(dim=0)
         except RuntimeError:
-            padded = nt.to_padded_tensor(0)
-            padded_chunks = padded.chunk(chunks, dim=0)
-            offsets = nt.offsets()
-            lengths = offsets.diff().tolist()
             for i, chunk_td in enumerate(tds):
-                chunk_lengths = lengths[i * chunk_size : (i + 1) * chunk_size]
-                chunk_tensors = [padded_chunks[i][j, :seq_len] for j, seq_len in enumerate(chunk_lengths)]
-                chunk_td[key] = torch.nested.as_nested_tensor(chunk_tensors, layout=torch.jagged)
+                start = i * chunk_size
+                end = (i + 1) * chunk_size
+                chunk_td[key] = _select_rows_from_jagged_nested_tensor(nt, list(range(start, end)))
             continue
 
         for i, chunk_td in enumerate(tds):
@@ -461,10 +478,7 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
-                data_dict[key] = torch.nested.as_nested_tensor(
-                    [tensor_lst[idx] for idx in indices], layout=torch.jagged
-                )
+                data_dict[key] = _select_rows_from_jagged_nested_tensor(tensor, [int(idx) for idx in indices.tolist()])
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).
                 if tensor.shape:
