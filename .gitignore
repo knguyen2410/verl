@@ -7,6 +7,11 @@
 **/*.tar.gz
 **/playground
 **/wandb
+**/Training
+**/model
+**/adapter
+**/attack
+**/checkpoint-5400
 
 /pyrightconfig.json
 

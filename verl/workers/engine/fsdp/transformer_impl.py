@@ -189,6 +189,13 @@ class FSDPEngine(BaseEngine):
             trust_remote_code=self.model_config.trust_remote_code,
         )
 
+        # Forward pre-FSDP-captured hybrid trainable names so the checkpoint
+        # manager can write ``trainable_parameters.bin`` even though FSDP1 has
+        # already collapsed the original parameter names into FlatParameters.
+        hybrid_names = getattr(self, "_hybrid_trainable_param_names", None)
+        if hybrid_names:
+            self.checkpoint_manager.hybrid_trainable_param_names = hybrid_names
+
         self.to(
             device="cpu",
             model=self._is_offload_param,
@@ -297,6 +304,47 @@ class FSDPEngine(BaseEngine):
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
 
+        # Build hybrid layer selection: optionally fully fine-tune the first/last
+        # transformer blocks while applying LoRA to the middle blocks. Mirrors the
+        # behavior of the legacy ActorRolloutRefWorker so that the
+        # ``full_finetune_first_layers`` / ``full_finetune_last_layers`` config
+        # options take effect under the new engine path as well.
+        from verl.workers.fsdp_workers import (
+            _build_full_finetune_patterns_from_layer_ids,
+            _build_hybrid_layer_selection,
+            _get_num_hidden_layers,
+        )
+
+        full_finetune_first_layers = int(getattr(self.model_config, "full_finetune_first_layers", 0) or 0)
+        full_finetune_last_layers = int(getattr(self.model_config, "full_finetune_last_layers", 0) or 0)
+        num_layers = _get_num_hidden_layers(self.model_config.hf_config)
+        full_layer_ids, lora_layer_ids = _build_hybrid_layer_selection(
+            num_layers=num_layers,
+            first_layers=full_finetune_first_layers,
+            last_layers=full_finetune_last_layers,
+        )
+
+        auto_full_finetune_modules = _build_full_finetune_patterns_from_layer_ids(
+            full_layer_ids, include_final_modules=full_finetune_last_layers > 0
+        )
+        configured_full_finetune_modules = convert_to_regular_types(
+            getattr(self.model_config, "full_finetune_modules", None)
+        )
+        full_finetune_modules = (
+            (configured_full_finetune_modules or []) + auto_full_finetune_modules
+            if configured_full_finetune_modules is not None or auto_full_finetune_modules
+            else None
+        )
+        if full_finetune_modules:
+            full_finetune_modules = list(dict.fromkeys(full_finetune_modules))
+
+        if self.rank == 0 and (full_finetune_first_layers > 0 or full_finetune_last_layers > 0):
+            print(
+                "[model] Hybrid tuning enabled: "
+                f"first={full_finetune_first_layers}, last={full_finetune_last_layers}, "
+                f"num_layers={num_layers}, full_layers={sorted(full_layer_ids)}, lora_layers={lora_layer_ids}"
+            )
+
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
         if lora_adapter_path is not None:
             from peft import PeftModel
@@ -322,23 +370,75 @@ class FSDPEngine(BaseEngine):
                     f"{num_tensors} tensors ({num_missing} missing, {num_unexpected} unexpected)"
                 )
         else:
-            # Convert config to regular Python types before creating PEFT model
+            target_modules = convert_to_regular_types(self.model_config.target_modules)
+            # PEFT forbids ``layers_to_transform`` together with a string ``target_modules``
+            # (e.g. ``"all-linear"``). When hybrid tuning restricts LoRA to a subset of
+            # layers, fall back to an explicit module list from ``model.lora.target_modules``.
+            if lora_layer_ids and isinstance(target_modules, str):
+                target_modules_from_lora_cfg = convert_to_regular_types(
+                    getattr(self.model_config, "lora", {}).get("target_modules", None)
+                )
+                if isinstance(target_modules_from_lora_cfg, (list, tuple)) and len(target_modules_from_lora_cfg) > 0:
+                    target_modules = list(target_modules_from_lora_cfg)
+
             lora_config = {
                 "task_type": TaskType.CAUSAL_LM,
                 "r": self.model_config.lora_rank,
                 "lora_alpha": self.model_config.lora_alpha,
-                "target_modules": convert_to_regular_types(self.model_config.target_modules),
+                "target_modules": target_modules,
                 "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
                 "bias": "none",
             }
+            if lora_layer_ids and len(lora_layer_ids) != (num_layers or 0):
+                lora_config["layers_to_transform"] = lora_layer_ids
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-        num_unfrozen, num_matched = unfreeze_params_by_patterns(module, self.model_config.full_finetune_modules)
-        if self.model_config.full_finetune_modules and self.rank == 0:
+        num_unfrozen, num_matched = unfreeze_params_by_patterns(module, full_finetune_modules)
+        if full_finetune_modules and self.rank == 0:
             print(
                 "[model] full_finetune_modules matched "
                 f"{num_matched} parameter names and unfroze {num_unfrozen} parameters"
+            )
+
+        # Hybrid LoRA + full-FT requires uniform gradient dtype across all trainable
+        # parameters before they are wrapped by FSDP. PEFT-injected LoRA adapters are
+        # created in float32, while the base parameters we just unfroze inherit the
+        # model dtype (bf16 when model_dtype=bf16). Promote the unfrozen non-LoRA
+        # params to float32 to avoid:
+        #   ValueError: Requires uniform dtype across all gradients but got
+        #               {torch.bfloat16, torch.float32}
+        if full_finetune_modules:
+            num_promoted = 0
+            for name, param in module.named_parameters():
+                if (
+                    param.requires_grad
+                    and "lora_" not in name
+                    and "modules_to_save" not in name
+                    and param.dtype != torch.float32
+                ):
+                    param.data = param.data.to(torch.float32)
+                    num_promoted += 1
+            if num_promoted > 0 and self.rank == 0:
+                print(f"[model] Promoted {num_promoted} unfrozen base parameters to float32 for FSDP grad-dtype uniformity")
+
+        # Capture trainable (non-LoRA) parameter names BEFORE FSDP wraps the module.
+        # FSDP1 replaces individual nn.Parameter objects with FlatParameter shards,
+        # which destroys the original ``model.layers.X.*`` naming required to write
+        # ``trainable_parameters.bin``. The checkpoint manager (built later in
+        # ``initialize``) reads this set via ``hybrid_trainable_param_names``.
+        self._hybrid_trainable_param_names = set()
+        for name, param in module.named_parameters():
+            if (
+                param.requires_grad
+                and "lora_" not in name
+                and "modules_to_save" not in name
+            ):
+                self._hybrid_trainable_param_names.add(name)
+        if self._hybrid_trainable_param_names and self.rank == 0:
+            print(
+                f"[model] Captured {len(self._hybrid_trainable_param_names)} hybrid trainable param names "
+                "for trainable_parameters.bin"
             )
 
         return module

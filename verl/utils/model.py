@@ -224,6 +224,11 @@ def collect_non_lora_trainable_params(
 ) -> tuple[dict[str, torch.Tensor], int, int]:
     """Collect trainable tensors excluding LoRA tensors for hybrid checkpoints.
 
+    NOTE: Caller must ensure ``module`` exposes materialized (unsharded) parameters.
+    Under FSDP, the values returned by ``param.detach().cpu()`` would otherwise be
+    shard-local and silently corrupt. Use
+    :func:`collect_non_lora_trainable_params_fsdp` for FSDP-wrapped models.
+
     Returns:
         (state_dict, num_tensors, num_elements)
     """
@@ -253,10 +258,107 @@ def collect_non_lora_trainable_params(
     return state_dict, num_tensors, num_elements
 
 
+def collect_non_lora_trainable_params_fsdp(
+    fsdp_model: nn.Module,
+    include_embed_tokens: bool = True,
+    trainable_param_names: Optional[set[str]] = None,
+) -> tuple[dict[str, torch.Tensor], int, int]:
+    """FSDP-safe collective version of :func:`collect_non_lora_trainable_params`.
+
+    All ranks must call this (it issues collective gather ops). Only rank 0
+    receives a populated state_dict; other ranks receive ``({}, 0, 0)``.
+
+    Strategy:
+      1. Determine the set of trainable, non-LoRA parameter names. With FSDP1
+         the original ``nn.Parameter`` objects are replaced by ``FlatParameter``
+         shards, so iterating ``named_parameters()`` after wrapping yields the
+         wrong names. The caller should pass ``trainable_param_names`` captured
+         BEFORE the model is FSDP-wrapped. As a fallback (e.g. FSDP2 or models
+         without LoRA), we attempt to inspect the unwrapped module.
+      2. Collectively gather the model's full state dict via
+         :func:`verl.utils.fsdp_utils.get_fsdp_full_state_dict`.
+      3. On rank 0, filter the gathered state dict by the trainable name set.
+    """
+    import torch.distributed as dist
+
+    from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict
+
+    if fsdp_version(fsdp_model) == 1:
+        inspect = getattr(fsdp_model, "_fsdp_wrapped_module", fsdp_model)
+    else:
+        inspect = fsdp_model
+
+    if trainable_param_names is None or len(trainable_param_names) == 0:
+        trainable_names: set[str] = set()
+        for name, param in inspect.named_parameters():
+            if param.requires_grad and "lora_" not in name and "modules_to_save" not in name:
+                trainable_names.add(name)
+    else:
+        trainable_names = set(trainable_param_names)
+
+    embed_param_name: Optional[str] = None
+    if include_embed_tokens and hasattr(inspect, "get_input_embeddings"):
+        try:
+            embed = inspect.get_input_embeddings()
+            if embed is not None and hasattr(embed, "weight"):
+                # Try to find the param name by identity first; fall back to
+                # canonical "model.embed_tokens.weight".
+                embed_param_name = "model.embed_tokens.weight"
+                for name, param in inspect.named_parameters():
+                    if param is embed.weight:
+                        embed_param_name = name
+                        break
+                trainable_names.add(embed_param_name)
+        except Exception:
+            pass
+
+    full_state = get_fsdp_full_state_dict(fsdp_model, offload_to_cpu=True, rank0_only=True)
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return {}, 0, 0
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for tname in trainable_names:
+        value = full_state.get(tname)
+        if value is None:
+            # FSDP may add/remove a wrapper prefix; try suffix-match as a fallback.
+            candidates = [k for k in full_state.keys() if k.endswith(tname)]
+            if not candidates:
+                continue
+            value = full_state[candidates[0]]
+
+        save_name = tname
+        if save_name.startswith("base_model.model."):
+            save_name = save_name[len("base_model.model.") :]
+        if tname == embed_param_name:
+            save_name = "model.embed_tokens.weight"
+
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().clone()
+        state_dict[save_name] = value
+
+    num_tensors = len(state_dict)
+    num_elements = sum(t.numel() for t in state_dict.values() if hasattr(t, "numel"))
+    return state_dict, num_tensors, num_elements
+
+
+# Filenames searched (in order) by ``load_hybrid_trainable_params_if_available``.
+# ``trainable_parameters.bin`` is the verl-native name; ``pgcode_trainable_params.bin``
+# is kept for backward compatibility with checkpoints produced by the SFT pipeline.
+HYBRID_TRAINABLE_PARAMS_FILENAMES: tuple[str, ...] = (
+    "trainable_parameters.bin",
+    "pgcode_trainable_params.bin",
+)
+
+
 def load_hybrid_trainable_params_if_available(
-    module: nn.Module, checkpoint_dir: str, filename: str = "pgcode_trainable_params.bin"
+    module: nn.Module, checkpoint_dir: str, filename: Optional[str] = None
 ) -> tuple[bool, int, int, int]:
     """Load hybrid full-tuned tensors if they exist next to a LoRA checkpoint.
+
+    If ``filename`` is None, searches the standard names in
+    :data:`HYBRID_TRAINABLE_PARAMS_FILENAMES` and uses the first that exists.
 
     Returns:
         (loaded, num_tensors, num_missing, num_unexpected)
@@ -264,8 +366,20 @@ def load_hybrid_trainable_params_if_available(
     if not checkpoint_dir:
         return False, 0, 0, 0
 
-    trainable_path = os.path.join(checkpoint_dir, filename)
-    if not os.path.isfile(trainable_path):
+    candidates: tuple[str, ...]
+    if filename is None:
+        candidates = HYBRID_TRAINABLE_PARAMS_FILENAMES
+    else:
+        candidates = (filename,)
+
+    trainable_path = None
+    for cand in candidates:
+        cand_path = os.path.join(checkpoint_dir, cand)
+        if os.path.isfile(cand_path):
+            trainable_path = cand_path
+            break
+
+    if trainable_path is None:
         return False, 0, 0, 0
 
     trainable_state_dict = torch.load(trainable_path, map_location="cpu")

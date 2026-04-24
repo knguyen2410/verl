@@ -801,9 +801,19 @@ class AgentLoopWorker:
         if self.processor is None:
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+        # Text-only fallback: when there are no images/videos, avoid invoking
+        # processor.get_rope_index (which builds 4D mrope position_ids and may
+        # be incompatible with the model's actor-side forward path). Returning
+        # plain (1, seq_len) text positions keeps the model's standard RoPE
+        # path consistent with the per-sample input shape.
+        if image_grid_thw is None and video_grid_thw is None:
+            return compute_position_id_with_mask(attention_mask)
+
         multi_modal_kwargs = {
-            "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
-            "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
         }
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
